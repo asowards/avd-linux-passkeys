@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Create a Remmina profile from an AVD .rdpw file.
+# Usage: avd-profile <session.rdpw> <username> <domain> [profile-name]
+set -euo pipefail
+[ $# -ge 3 ] || { echo "Usage: avd-profile <session.rdpw> <username> <domain> [profile-name]" >&2; exit 1; }
+RDP="$1"; USER_NAME="$2"; DOMAIN="$3"; NAME="${4:-AVD}"
+val() { tr -d '\r' < "$RDP" | sed -n "s/^$1:[si]://p" | head -1; }
+SERVER="$(val 'full address')"; GW="$(val gatewayhostname)"; LBI="$(val loadbalanceinfo)"
+APP="$(val remoteapplicationprogram)"; MULTIMON="$(val 'use multimon')"
+[ -n "$SERVER" ] && [ -n "$GW" ] && [ -n "$LBI" ] || { echo "avd-profile: $RDP lacks full address/gatewayhostname/loadbalanceinfo" >&2; exit 1; }
+DIR="$HOME/.local/share/remmina"; mkdir -p "$DIR"
+SLUG="$(echo "$NAME" | tr -c 'A-Za-z0-9_\n-' '_')"
+OUT="$DIR/avd_${SLUG}.remmina"
+cat > "$OUT" << PROFILE
+[remmina]
+name=$NAME
+group=AVD
+protocol=RDP
+server=$SERVER
+username=$USER_NAME
+domain=$DOMAIN
+gateway_server=$GW
+gwtransp=arm
+loadbalanceinfo=$LBI
+remoteapplicationprogram=$APP
+aad_external_browser=1
+aad_browser=${AVD_BROWSER:-flatpak run com.google.Chrome}
+sharewebauthn=1
+multimon=${MULTIMON:-1}
+viewmode=4
+scale=2
+resolution_mode=1
+quality=9
+network=lan
+colordepth=32
+sound=local
+dvc=rdpecam,encode:${AVD_CAMERA_ENCODE:-0}
+cert_ignore=0
+disableclipboard=0
+PROFILE
+echo "wrote $OUT"

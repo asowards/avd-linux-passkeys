@@ -1,0 +1,70 @@
+From c2508dc1fe8227692c78707cb74593e52bdd739b Mon Sep 17 00:00:00 2001
+From: Aaron Sowards <asowards@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 20:33:55 -0400
+Subject: [PATCH 2/3] rdp: create the FreeRDP instance through the client
+ context API
+
+With FreeRDP 3 the plugin created its instance with freerdp_new() and
+freerdp_context_new() directly. Client-common facilities that live in
+rdpClientContext (the AAD auth helper and its OAuth2 state, default
+callbacks) are only initialised by freerdp_client_context_new(), and
+FreeRDP asserts on a context without client entry points when they are
+used (e.g. freerdp_client_get_aad_url). Create the instance through the
+client context API on FreeRDP 3; Remmina's callbacks still override the
+defaults, and the existing teardown already frees pClientEntryPoints.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ plugins/rdp/rdp_plugin.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/plugins/rdp/rdp_plugin.c b/plugins/rdp/rdp_plugin.c
+index 17c69e603..be4d38a1d 100644
+--- a/plugins/rdp/rdp_plugin.c
++++ b/plugins/rdp/rdp_plugin.c
+@@ -71,6 +71,7 @@
+ #include <freerdp/client/channels.h>
+ #include <freerdp/client/cliprdr.h>
+ #include <freerdp/client/cmdline.h>
++#include <freerdp/client.h>
+ #include <freerdp/constants.h>
+ #include <freerdp/error.h>
+ #include <freerdp/event.h>
+@@ -2899,7 +2900,23 @@ static void remmina_rdp_init(RemminaProtocolWidget *gp)
+ 	rfContext *rfi;
+ 	gchar* auth_list;
+ 
++#if FREERDP_VERSION_MAJOR >= 3
++	/* Create the instance through FreeRDP's client context API: client-common facilities such
++	 * as the AAD auth helper and its OAuth2 state live in rdpClientContext and are only set up
++	 * by freerdp_client_context_new(). Remmina's own callbacks override the defaults below. */
++	RDP_CLIENT_ENTRY_POINTS entry_points = { 0 };
++	entry_points.Size = sizeof(entry_points);
++	entry_points.Version = RDP_CLIENT_INTERFACE_VERSION;
++	entry_points.ContextSize = sizeof(rfContext);
++	rdpContext *client_context = freerdp_client_context_new(&entry_points);
++	if (!client_context) {
++		REMMINA_PLUGIN_ERROR("freerdp_client_context_new failed");
++		return;
++	}
++	instance = client_context->instance;
++#else
+ 	instance = freerdp_new();
++#endif
+ 	instance->PreConnect = remmina_rdp_pre_connect;
+ 	instance->PostConnect = remmina_rdp_post_connect;
+ 	instance->PostDisconnect = remmina_rdp_post_disconnect;
+@@ -2919,8 +2936,10 @@ static void remmina_rdp_init(RemminaProtocolWidget *gp)
+ 	instance->GatewayAuthenticate = remmina_rdp_gw_authenticate;
+ #endif
+ 
++#if FREERDP_VERSION_MAJOR < 3
+ 	instance->ContextSize = sizeof(rfContext);
+ 	freerdp_context_new(instance);
++#endif
+ 	rfi = (rfContext *)instance->context;
+ 
+ 	g_object_set_data_full(G_OBJECT(gp), "plugin-data", rfi, free);
+-- 
+2.43.0
+

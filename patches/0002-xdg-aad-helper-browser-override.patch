@@ -1,0 +1,42 @@
+Subject: [client,xdg-aad-helper] allow overriding the browser via FREERDP_AAD_BROWSER
+
+Lets the launcher pick a specific browser for the Entra sign-in (e.g. Flatpak
+Chrome, which supports phone/hybrid passkeys) without changing the system default
+browser or overriding XDG_CONFIG_HOME for the whole FreeRDP process.
+
+diff --git a/client/common/xdg-aad-helper/xdg-aad-helper.py b/client/common/xdg-aad-helper/xdg-aad-helper.py
+index 9eed2fa..c9313df 100755
+--- a/client/common/xdg-aad-helper/xdg-aad-helper.py
++++ b/client/common/xdg-aad-helper/xdg-aad-helper.py
+@@ -93,6 +93,22 @@ def ensure_handler_installed() -> None:
+               f"x-scheme-handler/ms-appx-web: {exc}", file=sys.stderr)
+ 
+ 
++def browser_command(url: str) -> list[str]:
++    """Builds the command used to open the IdP URL. By default this is xdg-open (the user's
++    default browser). FREERDP_AAD_BROWSER overrides it with a shell-split command, e.g.
++    'flatpak run com.google.Chrome' or 'firefox --new-window'; a literal '%u' placeholder is
++    replaced by the URL, otherwise the URL is appended as the last argument. Useful when the
++    IdP needs a browser capability the default browser lacks (e.g. hybrid/phone passkeys)."""
++    override = os.environ.get("FREERDP_AAD_BROWSER", "").strip()
++    if not override:
++        return ["xdg-open", url]
++    import shlex
++    argv = shlex.split(override)
++    if "%u" in argv:
++        return [url if a == "%u" else a for a in argv]
++    return argv + [url]
++
++
+ def import_handle(arg_value: str) -> int:
+     """Reverses winpr_exportHandleToString() for the POSIX pipe case: the
+     value is 'P<hex-fd>' ('P' = HANDLE_TYPE_ANONYMOUS_PIPE, see
+@@ -247,7 +263,7 @@ class Session:
+ 
+             print(f"[xdgopen-aad-helper] navigate: opening browser for {effective_url!r} "
+                   f"(title={title!r}), waiting on {sock_path}", file=sys.stderr)
+-            subprocess.Popen(["xdg-open", effective_url])
++            subprocess.Popen(browser_command(effective_url))
+ 
+             deadline = time.monotonic() + timeout_ms / 1000.0
+             while redirect_url is None and error is None:

@@ -1,0 +1,138 @@
+Subject: [channels,rdpecam] "encode" option for MJPEG/raw passthrough, realtime x264 preset
+
+The camera channel always offered H.264 first, so the server picked it and
+every frame was decoded from the webcam's MJPEG and re-encoded with x264 at
+the "medium" preset on the client CPU, which cannot keep up at 720p/1080p.
+
+- New channel argument encode:<0|1> (default 1). With encode:0 the H.264
+  output entries are left out of the offered media types, so the camera's own
+  MJPEG (or raw) samples are transmitted unchanged. This is what the
+  "encode redirected video capture" .rdp property already maps to.
+- Use the "veryfast" x264 preset for H264_CAMERA_VIDEO_REAL_TIME usage.
+
+diff --git a/channels/rdpecam/client/camera.h b/channels/rdpecam/client/camera.h
+index 1d17e23..73c143b 100644
+--- a/channels/rdpecam/client/camera.h
++++ b/channels/rdpecam/client/camera.h
+@@ -66,6 +66,7 @@ typedef struct
+ 	/* HAL interface */
+ 	ICamHal* ihal;
+ 	char* subsystem;
++	BOOL encodeH264; /**< offer H.264 (client-side encoding); FALSE = passthrough/raw only */
+ 
+ 	BOOL initialized;
+ 	BOOL attached;
+diff --git a/channels/rdpecam/client/camera_device_enum_main.c b/channels/rdpecam/client/camera_device_enum_main.c
+index e939e01..d027934 100644
+--- a/channels/rdpecam/client/camera_device_enum_main.c
++++ b/channels/rdpecam/client/camera_device_enum_main.c
+@@ -547,6 +547,10 @@ static BOOL ecam_process_addin_args(CameraPlugin* ecam, const ADDIN_ARGV* args)
+ 
+ 	COMMAND_LINE_ARGUMENT_A ecam_args[] = { { "sys", COMMAND_LINE_VALUE_REQUIRED, "<subsystem>",
+ 		                                      nullptr, nullptr, -1, nullptr, "subsystem" },
++		                                    { "encode", COMMAND_LINE_VALUE_REQUIRED, "<0|1>", nullptr,
++		                                      nullptr, -1, nullptr,
++		                                      "encode captured video as H.264 (1, default) or "
++		                                      "transmit the camera's MJPEG/raw format (0)" },
+ 		                                    { nullptr, 0, nullptr, nullptr, nullptr, -1, nullptr,
+ 		                                      nullptr } };
+ 
+@@ -566,6 +570,15 @@ static BOOL ecam_process_addin_args(CameraPlugin* ecam, const ADDIN_ARGV* args)
+ 		/* the value points into args, which outlive the plugin */
+ 		ecam->subsystem = arg->Value;
+ 	}
++	arg = CommandLineFindArgumentA(ecam_args, "encode");
++	if (arg && (arg->Flags & COMMAND_LINE_VALUE_PRESENT) && arg->Value)
++	{
++		errno = 0;
++		const unsigned long v = strtoul(arg->Value, nullptr, 10);
++		if (errno == 0)
++			ecam->encodeH264 = (v != 0);
++		WLog_DBG(TAG, "H.264 encoding of captured video %s", ecam->encodeH264 ? "on" : "off");
++	}
+ 	return TRUE;
+ }
+ 
+@@ -594,6 +607,7 @@ FREERDP_ENTRY_POINT(UINT VCAPITYPE rdpecam_DVCPluginEntry(IDRDYNVC_ENTRY_POINTS*
+ 	}
+ 
+ 	ecam->attached = TRUE;
++	ecam->encodeH264 = TRUE;
+ 	ecam->iface.Initialize = ecam_plugin_initialize;
+ 	ecam->iface.Connected = nullptr; /* server connects to client */
+ 	ecam->iface.Disconnected = nullptr;
+diff --git a/channels/rdpecam/client/camera_device_main.c b/channels/rdpecam/client/camera_device_main.c
+index d794415..f518148 100644
+--- a/channels/rdpecam/client/camera_device_main.c
++++ b/channels/rdpecam/client/camera_device_main.c
+@@ -37,7 +37,7 @@
+  * @return Pointer to format array
+  */
+ WINPR_ATTR_NODISCARD
+-static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount)
++static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount, BOOL includeH264)
+ {
+ 	WINPR_ASSERT(pCount);
+ 
+@@ -70,6 +70,26 @@ static const CAM_MEDIA_FORMAT_INFO* getSupportedFormats(size_t* pCount)
+ 		initialized = TRUE;
+ 	}
+ 
++	if (!includeH264)
++	{
++		/* Same table without the client-side H.264 encoding entries: the camera's own
++		 * MJPEG (or raw) samples are transmitted unchanged, which costs no CPU. */
++		static CAM_MEDIA_FORMAT_INFO noEncode[ARRAYSIZE(formats)];
++		static size_t noEncodeCount = 0;
++		static BOOL noEncodeInitialized = FALSE;
++		if (!noEncodeInitialized)
++		{
++			for (size_t x = 0; x < count; x++)
++			{
++				if (formats[x].outputFormat != CAM_MEDIA_FORMAT_H264)
++					noEncode[noEncodeCount++] = formats[x];
++			}
++			noEncodeInitialized = TRUE;
++		}
++		*pCount = noEncodeCount;
++		return noEncode;
++	}
++
+ 	*pCount = count;
+ 	return formats;
+ }
+@@ -377,7 +397,7 @@ static BOOL media_type_valid(CameraDevice* dev, UINT8 streamIndex,
+ 	size_t nMediaTypes = ARRAYSIZE(supported);
+ 
+ 	size_t nSupportedFormats = 0;
+-	const CAM_MEDIA_FORMAT_INFO* supportedFormats = getSupportedFormats(&nSupportedFormats);
++	const CAM_MEDIA_FORMAT_INFO* supportedFormats = getSupportedFormats(&nSupportedFormats, dev->ecam->encodeH264);
+ 	INT16 formatIndex =
+ 	    dev->ihal->GetMediaTypeDescriptions(dev->ihal, dev->deviceId, streamIndex, supportedFormats,
+ 	                                        nSupportedFormats, supported, &nMediaTypes);
+@@ -725,7 +745,7 @@ static UINT ecam_dev_process_media_type_list_request(CameraDevice* dev,
+ 	}
+ 
+ 	size_t nSupportedFormats = 0;
+-	const CAM_MEDIA_FORMAT_INFO* supportedFormats = getSupportedFormats(&nSupportedFormats);
++	const CAM_MEDIA_FORMAT_INFO* supportedFormats = getSupportedFormats(&nSupportedFormats, dev->ecam->encodeH264);
+ 
+ 	INT16 formatIndex =
+ 	    dev->ihal->GetMediaTypeDescriptions(dev->ihal, dev->deviceId, streamIndex, supportedFormats,
+diff --git a/libfreerdp/codec/h264_ffmpeg.c b/libfreerdp/codec/h264_ffmpeg.c
+index 5a73adf..61d7d67 100644
+--- a/libfreerdp/codec/h264_ffmpeg.c
++++ b/libfreerdp/codec/h264_ffmpeg.c
+@@ -580,7 +580,11 @@ static BOOL libavcodec_create_encoder_context(H264_CONTEXT* WINPR_RESTRICT h264)
+ 	else
+ #endif
+ 	{
+-		av_opt_set(sys->codecEncoderContext, "preset", "medium", AV_OPT_SEARCH_CHILDREN);
++		/* A live camera stream must be encoded faster than real time on the client CPU;
++		 * "medium" cannot keep up at 720p/1080p and the feed stutters. */
++		const char* preset =
++		    (h264->UsageType == H264_CAMERA_VIDEO_REAL_TIME) ? "veryfast" : "medium";
++		av_opt_set(sys->codecEncoderContext, "preset", preset, AV_OPT_SEARCH_CHILDREN);
+ 		sys->codecEncoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
+ 	}
+ 

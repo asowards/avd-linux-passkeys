@@ -1,0 +1,28 @@
+[package]
+name = "freerdp-webauthn-helper"
+version = "0.1.0"
+edition = "2021"
+
+license = "GPL-3.0-or-later"
+
+[dependencies]
+libwebauthn = "0.10"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+serde_bytes = "0.11"
+qrcode = "0.14"
+ciborium = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-normalization = "0.1"
+rand = "0.8"
+gtk = "0.18"
+
+[[bin]]
+name = "freerdp-webauthn-helper"
+path = "src/main.rs"
+
+[dev-dependencies]
+text_io = "0.1"

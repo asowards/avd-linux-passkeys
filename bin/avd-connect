@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Connect to Azure Virtual Desktop with FreeRDP 3 master (installed in /usr/local).
+#
+# Usage: avd-connect <session.rdpw> [username] [domain] [extra freerdp args...]
+# Env:   AVD_CLIENT           xfreerdp (default) | sdl
+#        AVD_BROWSER          browser command for the Entra sign-in (default: Flatpak Chrome)
+#        AVD_WINDOWED=1       do not go fullscreen/multi-monitor
+#        AVD_CERT_IGNORE=1    pass /cert:ignore
+#        AVD_DEBUG=1          rdpewa/aad/arm debug logging
+#        AVD_WEBAUTHN_HELPER  path to freerdp-webauthn-helper (phone passkeys); auto-detected
+#        AVD_NO_KEYRING=1     never read the Windows password from the keyring
+#
+# Windows password (xfreerdp): read from the GNOME keyring if stored with
+#     secret-tool store --label='AVD password' service avd-connect user <username>
+# otherwise asked for with a zenity dialog, and handed to FreeRDP over stdin (/from-stdin),
+# never on the command line.
+set -euo pipefail
+
+if [ -z "${1:-}" ]; then
+    echo "Usage: avd-connect <path-to-session.rdpw> [username] [domain] [extra args...]" >&2
+    exit 1
+fi
+
+RDP_FILE="$1"; shift
+USER_NAME="${1:-}"; [ $# -gt 0 ] && shift
+DOMAIN="${1:-}";    [ $# -gt 0 ] && shift
+USER_ARG=(); DOMAIN_ARG=()
+[ -n "$USER_NAME" ] && USER_ARG=(/u:"$USER_NAME")
+[ -n "$DOMAIN" ]    && DOMAIN_ARG=(/d:"$DOMAIN")
+
+# Resolve the real location even when invoked through the ~/.local/bin symlink.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PROJECT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+CLIENT="${AVD_CLIENT:-xfreerdp}"
+
+# Work on a sanitized copy; never edit the downloaded file in place.
+TMP_DIR="${XDG_RUNTIME_DIR:-/tmp}/avd-connect.$$"
+mkdir -p "$TMP_DIR"; trap 'rm -rf "$TMP_DIR"' EXIT
+SANITIZED="$TMP_DIR/session.rdp"
+tr -d '\r' < "$RDP_FILE" \
+  | sed 's/^redirectwebauthn:i:1dynamic/redirectwebauthn:i:1\ndynamic/' > "$SANITIZED"
+# The .rdp file is applied after the command line, so "-video" alone cannot switch off
+# video-optimized remoting; rewrite the setting in the sanitized copy instead (see AVD_VIDEO).
+if [ "${AVD_VIDEO:-0}" != 1 ]; then
+    sed -i 's/^videoplaybackmode:i:1$/videoplaybackmode:i:0/' "$SANITIZED"
+fi
+# Camera: transmit the webcam's own MJPEG instead of re-encoding to H.264 on the CPU
+# (FreeRDP maps this key to the rdpecam "encode:" option; patch 0005). AVD_CAMERA_ENCODE=1 keeps H.264.
+if ! grep -q '^encode redirected video capture:i:' "$SANITIZED"; then
+    echo "encode redirected video capture:i:${AVD_CAMERA_ENCODE:-0}" >> "$SANITIZED"
+fi
+
+# Entra sign-in browser (phone passkeys need Chrome's hybrid transport; Firefox lacks it).
+export FREERDP_AAD_BROWSER="${AVD_BROWSER:-flatpak run com.google.Chrome}"
+
+# Phone-passkey helper for in-session WebAuthn. Falls back to libfido2 if absent.
+HELPER="${AVD_WEBAUTHN_HELPER:-$PROJECT_DIR/helper/target/release/freerdp-webauthn-helper}"
+if [ -x "$HELPER" ]; then
+    export FREERDP_RDPEWA_HELPER="$HELPER"
+    # Advertise WebAuthn API version 6+ so the session host offers the hybrid (phone)
+    # transport instead of filtering it out; the helper serves it.
+    export FREERDP_RDPEWA_API_VERSION="${AVD_WEBAUTHN_API_VERSION:-6}"
+    # Answer "no user-verifying platform authenticator" (Linux has none; the YubiKey is a
+    # roaming authenticator). AVD_WEBAUTHN_IUVPAA=1 restores FreeRDP's any-device answer.
+    export FREERDP_RDPEWA_IUVPAA="${AVD_WEBAUTHN_IUVPAA:-0}"
+else
+    echo "avd-connect: WebAuthn helper not found at $HELPER; phone passkeys disabled (USB key only)" >&2
+fi
+
+EXTRA=()
+[ "${AVD_CERT_IGNORE:-0}" = 1 ] && EXTRA+=(/cert:ignore)
+# The .rdpw enables video-optimized remoting (geometry+video channels). AVD reopens the
+# geometry channel repeatedly, which the Linux client rejects with noisy "Channel already
+# connected" errors, and the feature needs MMR support the client lacks. Off unless asked.
+[ "${AVD_VIDEO:-0}" = 1 ] || EXTRA+=(-video -geometry)
+# Graphics pipeline. AVC444 (H.264 4:4:4, decoded by FFmpeg) is what Windows App negotiates
+# with AVD; RFX (RemoteFX) is the fallback if AVC shows black frames or artifacts;
+# "progressive" is FreeRDP's default; "off" leaves it to the client defaults.
+GFX="${AVD_GFX:-AVC444}"
+[ "$GFX" = off ] || EXTRA+=("/gfx:$GFX")
+# Decouple screen updates from the X11 event loop (helps late repaints on XWayland).
+[ "${AVD_ASYNC_UPDATE:-1}" = 1 ] && EXTRA+=(+async-update)
+[ "${AVD_ASYNC_CHANNELS:-0}" = 1 ] && EXTRA+=(+async-channels)
+[ -n "${AVD_GDI:-}" ] && EXTRA+=("/gdi:$AVD_GDI")          # sw | hw (XRender)
+[ -n "${AVD_NETWORK:-}" ] && EXTRA+=("/network:$AVD_NETWORK")  # lan | auto | broadband-high ...
+# Experiment: the session host marks every WebAuthn request "filterHybridTransport" (no
+# phone/QR option) and never asks our WebAuthn API version, so it keys on the client's
+# identity. Present as a Windows client: OS type in the RDP general capability set and the
+# user agents sent to the AVD gateway. AVD_IDENTIFY_AS_WINDOWS=0 disables it.
+if [ "${AVD_IDENTIFY_AS_WINDOWS:-0}" = 1 ]; then
+    UA="${AVD_CLIENT_UA:-MSRDC/1.2.6276.0}"
+    # Client build number: FreeRDP's default 18363 is Windows 10 1909; hybrid/phone passkeys
+    # need Windows 11 22H2 (22621) or later on a Windows client, so report 24H2 (26100).
+    BUILD="${AVD_CLIENT_BUILD:-26100}"
+    EXTRA+=("/tune:FreeRDP_OsMajorType:1,FreeRDP_OsMinorType:3,FreeRDP_ClientBuild:$BUILD,FreeRDP_GatewayHttpMsUserAgent:$UA,FreeRDP_GatewayHttpUserAgent:$UA")
+fi
+if [ "${AVD_DEBUG:-0}" = 1 ]; then
+    EXTRA+=(/log-level:INFO
+            '/log-filters:com.freerdp.channels.rdpewa.client:DEBUG,com.freerdp.client.common.aadauth:DEBUG,com.freerdp.aad:DEBUG,com.freerdp.core.gateway.arm:DEBUG,com.freerdp.core.gateway.http:DEBUG,com.freerdp.core.connection:DEBUG,com.freerdp.crypto:DEBUG,com.freerdp.client.SDL:DEBUG,com.freerdp.channels.drdynvc.client:DEBUG')
+else
+    EXTRA+=(/log-level:WARN)
+fi
+
+case "$CLIENT" in
+xfreerdp)
+    BIN=/usr/local/bin/xfreerdp
+    # The .rdpw asks for multi-monitor fullscreen ("use multimon:i:1"); honour it unless windowed.
+    [ "${AVD_WINDOWED:-0}" = 1 ] && EXTRA+=(-multimon) || EXTRA+=(/multimon)
+
+    # Windows password for the RDSTLS logon: keyring -> zenity -> terminal prompt.
+    PW=""
+    if [ -n "$USER_NAME" ] && [ "${AVD_NO_KEYRING:-0}" != 1 ] && command -v secret-tool >/dev/null 2>&1; then
+        PW="$(secret-tool lookup service avd-connect user "$USER_NAME" 2>/dev/null || true)"
+    fi
+    if [ -z "$PW" ] && command -v zenity >/dev/null 2>&1; then
+        PW="$(zenity --password --title="AVD: Windows password for ${DOMAIN:+$DOMAIN\\}$USER_NAME" 2>/dev/null || true)"
+    fi
+    if [ -n "$PW" ]; then
+        # The RDSTLS prompt (client_cli_authenticate_raw, queryAll) reads three lines:
+        # username, domain, password. An empty line keeps the value given with /u and /d.
+        exec "$BIN" "$SANITIZED" "${USER_ARG[@]}" "${DOMAIN_ARG[@]}" \
+            /gateway:type:arm /from-stdin "${EXTRA[@]}" "$@" < <(printf '\n\n%s\n' "$PW")
+    fi
+    echo "avd-connect: no password source (keyring/zenity); FreeRDP will prompt in the terminal" >&2
+    exec "$BIN" "$SANITIZED" "${USER_ARG[@]}" "${DOMAIN_ARG[@]}" /gateway:type:arm "${EXTRA[@]}" "$@"
+    ;;
+sdl)
+    BIN=/usr/local/bin/sdl-freerdp   # SDL3 client (native Wayland, clipboard support)
+    # Prefer the native Wayland backend; on X11 (XWayland) the NVIDIA GLX vendor library fails.
+    # SDL3 reads SDL_VIDEO_DRIVER, SDL2 read SDL_VIDEODRIVER; set both.
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        export SDL_VIDEO_DRIVER="${AVD_SDL_VIDEODRIVER:-wayland}" SDL_VIDEODRIVER="${AVD_SDL_VIDEODRIVER:-wayland}"
+    elif [ -n "${AVD_SDL_VIDEODRIVER:-}" ]; then
+        export SDL_VIDEO_DRIVER="$AVD_SDL_VIDEODRIVER" SDL_VIDEODRIVER="$AVD_SDL_VIDEODRIVER"
+    fi
+    # Silence the "experimental client" banner (WARN level) unless debugging.
+    [ "${AVD_DEBUG:-0}" = 1 ] || EXTRA+=('/log-filters:com.freerdp.client.common.cmdline:ERROR,com.freerdp.core.rdp:ERROR')
+    [ "${AVD_SDL_SOFTWARE:-0}" = 1 ] && export SDL_RENDER_DRIVER=software
+    if [ "${SDL_VIDEODRIVER:-}" = x11 ]; then
+        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+    fi
+    [ "${AVD_WINDOWED:-0}" = 1 ] || EXTRA+=(/f)
+    # No connection-progress popup (also set in config/sdl-freerdp.json).
+    [ "${AVD_SDL_DIALOG:-0}" = 1 ] || EXTRA+=(-sdl-connection-dialog)
+    # Password via FreeRDP's askpass hook (keyring or zenity) instead of the SDL dialog.
+    export FREERDP_ASKPASS="$PROJECT_DIR/bin/avd-askpass" AVD_USER="$USER_NAME"
+    exec "$BIN" "$SANITIZED" "${USER_ARG[@]}" "${DOMAIN_ARG[@]}" /gateway:type:arm "${EXTRA[@]}" "$@"
+    ;;
+*)
+    echo "avd-connect: unknown AVD_CLIENT '$CLIENT' (xfreerdp|sdl)" >&2; exit 2 ;;
+esac

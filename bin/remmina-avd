@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Launch Remmina (the /usr/local build) with the environment FreeRDP's WebAuthn helper needs,
+# so in-session passkeys (phone over hybrid/QR, or a security key) work from the GUI.
+# Entra sign-in browser and multimon/WebAuthn are per-profile settings (see avd-profile).
+set -euo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PROJECT_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+HELPER="${AVD_WEBAUTHN_HELPER:-$PROJECT_DIR/helper/target/release/freerdp-webauthn-helper}"
+if [ -x "$HELPER" ]; then
+    export FREERDP_RDPEWA_HELPER="$HELPER"
+    export FREERDP_RDPEWA_API_VERSION="${AVD_WEBAUTHN_API_VERSION:-6}"
+    export FREERDP_RDPEWA_IUVPAA="${AVD_WEBAUTHN_IUVPAA:-0}"
+fi
+BIN=/usr/local/bin/remmina
+# Remmina is single-instance (same application id for every build): if Ubuntu's packaged
+# /usr/bin/remmina is already running, a connect request would be handed to it and fail,
+# since it lacks the ARM gateway transport and the Entra sign-in option.
+if pgrep -f '^/usr/bin/remmina( |$)' >/dev/null 2>&1; then
+    echo "remmina-avd: the system Remmina (/usr/bin/remmina, 1.4.43) is running; quit it first (Ctrl+Q)." >&2
+    echo "             It cannot connect to AVD. Use the 'Azure Virtual Desktop (Remmina)' launcher or remmina-avd." >&2
+    exit 1
+fi
+[ -x "$BIN" ] || BIN="$(command -v remmina)"
+exec "$BIN" "$@"

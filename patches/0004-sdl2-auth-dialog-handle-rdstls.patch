@@ -1,0 +1,26 @@
+Subject: [client,sdl2] handle AUTH_RDSTLS in the credential dialog
+
+The SDL2 client never showed a prompt for AUTH_RDSTLS (used by the AVD ARM
+gateway redirect to collect the Windows password), so arm_fill_rdstls failed
+silently with "error retrieving ARM configuration". Ports the SDL3 client cases.
+
+diff --git a/client/SDL/SDL2/dialogs/sdl_dialogs.cpp b/client/SDL/SDL2/dialogs/sdl_dialogs.cpp
+index 3d19736..b593716 100644
+--- a/client/SDL/SDL2/dialogs/sdl_dialogs.cpp
++++ b/client/SDL/SDL2/dialogs/sdl_dialogs.cpp
+@@ -94,6 +94,7 @@ BOOL sdl_authenticate_ex(freerdp* instance, char** username, char** password, ch
+ 	const char* target = freerdp_settings_get_server_name(instance->context->settings);
+ 	switch (reason)
+ 	{
++		case AUTH_RDSTLS:
+ 		case AUTH_NLA:
+ 			break;
+ 
+@@ -567,6 +568,7 @@ BOOL sdl_auth_dialog_show(const SDL_UserAuthArg* args)
+ 		case AUTH_FIDO_PIN:
+ 			prompt = fidoPin;
+ 			break;
++		case AUTH_RDSTLS:
+ 		case AUTH_TLS:
+ 		case AUTH_RDP:
+ 		case AUTH_NLA:

@@ -1,0 +1,635 @@
+Subject: [channels,rdpewa] optional out-of-process WebAuthn helper backend
+
+When FREERDP_RDPEWA_HELPER names an executable, CTAP MakeCredential and
+GetAssertion requests from the server are handed to it as newline-delimited
+JSON (base64 CTAP2 request map + rpId/flags/timeout/filterHybrid) and its
+CTAP2 response map is returned to the server unchanged. This lets a helper
+built on libwebauthn answer with authenticators libfido2 cannot reach, e.g.
+phones over the hybrid (caBLE/QR) transport. Falls back to libfido2 when the
+helper is not configured or cannot be started. Also decodes the MS-RDPEWA 3.0
+"filterHybridTransport" request key, logs request values (incl. webAuthNPara)
+at DEBUG, lets FREERDP_RDPEWA_API_VERSION raise the advertised WebAuthn API
+version, and FREERDP_RDPEWA_IUVPAA force the platform-authenticator answer.
+
+diff --git a/channels/rdpewa/client/CMakeLists.txt b/channels/rdpewa/client/CMakeLists.txt
+index dc677f7..8241113 100644
+--- a/channels/rdpewa/client/CMakeLists.txt
++++ b/channels/rdpewa/client/CMakeLists.txt
+@@ -16,6 +16,9 @@
+ define_channel_client("rdpewa")
+ 
+ set(${MODULE_PREFIX}_SRCS rdpewa_main.c rdpewa_main.h rdpewa_cbor.c rdpewa_cbor.h rdpewa_fido.c rdpewa_fido.h)
++if(NOT WIN32)
++  list(APPEND ${MODULE_PREFIX}_SRCS rdpewa_helper.c rdpewa_helper.h)
++endif()
+ 
+ set(${MODULE_PREFIX}_LIBS winpr freerdp ${LIBCBOR_LIBRARIES} ${LIBFIDO2_LIBRARIES})
+ 
+diff --git a/channels/rdpewa/client/rdpewa_cbor.c b/channels/rdpewa/client/rdpewa_cbor.c
+index 7862ec7..f8ee06a 100644
+--- a/channels/rdpewa/client/rdpewa_cbor.c
++++ b/channels/rdpewa/client/rdpewa_cbor.c
+@@ -72,8 +72,40 @@ BOOL rdpewa_cbor_decode_request(const BYTE* data, size_t length, RDPEWA_REQUEST*
+ 		const char* keyStr = (const char*)cbor_string_handle(key);
+ 		const size_t keyLen = cbor_string_length(key);
+ 
+-		WLog_DBG(TAG, "  key[%" PRIuz "]: \"%.*s\" type=%u", i,
+-		         WINPR_ASSERTING_INT_CAST(int, keyLen), keyStr, cbor_typeof(value));
++		if (cbor_isa_float_ctrl(value) && cbor_is_bool(value))
++			WLog_DBG(TAG, "  key[%" PRIuz "]: \"%.*s\" = %s", i,
++			         WINPR_ASSERTING_INT_CAST(int, keyLen), keyStr,
++			         cbor_get_bool(value) ? "true" : "false");
++		else if (cbor_isa_uint(value))
++			WLog_DBG(TAG, "  key[%" PRIuz "]: \"%.*s\" = %" PRIu64, i,
++			         WINPR_ASSERTING_INT_CAST(int, keyLen), keyStr, cbor_get_int(value));
++		else if (cbor_isa_map(value))
++		{
++			WLog_DBG(TAG, "  key[%" PRIuz "]: \"%.*s\" = map(%" PRIuz ")", i,
++			         WINPR_ASSERTING_INT_CAST(int, keyLen), keyStr, cbor_map_size(value));
++			const struct cbor_pair* sub = cbor_map_handle(value);
++			for (size_t j = 0; j < cbor_map_size(value); j++)
++			{
++				if (!cbor_isa_string(sub[j].key))
++					continue;
++				const char* sk = (const char*)cbor_string_handle(sub[j].key);
++				const int skl = WINPR_ASSERTING_INT_CAST(int, cbor_string_length(sub[j].key));
++				if (cbor_isa_uint(sub[j].value))
++					WLog_DBG(TAG, "      %.*s = %" PRIu64, skl, sk, cbor_get_int(sub[j].value));
++				else if (cbor_isa_float_ctrl(sub[j].value) && cbor_is_bool(sub[j].value))
++					WLog_DBG(TAG, "      %.*s = %s", skl, sk,
++					         cbor_get_bool(sub[j].value) ? "true" : "false");
++				else if (cbor_isa_string(sub[j].value))
++					WLog_DBG(TAG, "      %.*s = \"%.*s\"", skl, sk,
++					         WINPR_ASSERTING_INT_CAST(int, cbor_string_length(sub[j].value)),
++					         (const char*)cbor_string_handle(sub[j].value));
++				else
++					WLog_DBG(TAG, "      %.*s : type=%u", skl, sk, cbor_typeof(sub[j].value));
++			}
++		}
++		else
++			WLog_DBG(TAG, "  key[%" PRIuz "]: \"%.*s\" type=%u", i,
++			         WINPR_ASSERTING_INT_CAST(int, keyLen), keyStr, cbor_typeof(value));
+ 
+ 		switch (keyLen)
+ 		{
+@@ -101,6 +133,13 @@ BOOL rdpewa_cbor_decode_request(const BYTE* data, size_t length, RDPEWA_REQUEST*
+ 					out->flags = WINPR_ASSERTING_INT_CAST(UINT32, cbor_get_int(value));
+ 				}
+ 				break;
++			case 21:
++				if (memcmp(keyStr, "filterHybridTransport", 21) == 0)
++				{
++					if (cbor_isa_float_ctrl(value) && cbor_is_bool(value))
++						out->filterHybrid = cbor_get_bool(value);
++				}
++				break;
+ 			case 7:
+ 				if (memcmp(keyStr, "command", 7) == 0)
+ 				{
+diff --git a/channels/rdpewa/client/rdpewa_cbor.h b/channels/rdpewa/client/rdpewa_cbor.h
+index 6f87032..2363a48 100644
+--- a/channels/rdpewa/client/rdpewa_cbor.h
++++ b/channels/rdpewa/client/rdpewa_cbor.h
+@@ -35,6 +35,7 @@ typedef struct
+ 	BYTE transactionId[16];
+ 	BOOL hasTransactionId;
+ 	char rpId[256];
++	BOOL filterHybrid; /**< MS-RDPEWA 3.0 "filterHybridTransport": exclude phone/hybrid */
+ } RDPEWA_REQUEST;
+ 
+ /** @brief Device info for the response map */
+diff --git a/channels/rdpewa/client/rdpewa_fido.c b/channels/rdpewa/client/rdpewa_fido.c
+index 0f89315..fcc505f 100644
+--- a/channels/rdpewa/client/rdpewa_fido.c
++++ b/channels/rdpewa/client/rdpewa_fido.c
+@@ -20,6 +20,9 @@
+ 
+ #include <freerdp/config.h>
+ 
++#include <errno.h>
++#include <stdlib.h>
++
+ #include <string.h>
+ #include <stdlib.h>
+ 
+@@ -1151,6 +1154,17 @@ wStream* rdpewa_fido_webauthn(rdpContext* context, const RDPEWA_REQUEST* request
+ 
+ wStream* rdpewa_fido_is_uvpaa(void)
+ {
++	/* IUVPAA asks for a user-verifying *platform* authenticator (Windows Hello class).
++	 * libfido2 only sees roaming (USB/NFC) authenticators, so the historical "any device
++	 * present" answer is a misreport. FREERDP_RDPEWA_IUVPAA=0|1 forces the answer. */
++	const char* force = getenv("FREERDP_RDPEWA_IUVPAA");
++	if (force && (force[0] == '0' || force[0] == '1') && force[1] == '\0')
++	{
++		const UINT32 forced = (UINT32)(force[0] - '0');
++		WLog_DBG(TAG, "IUVPAA: forced to %" PRIu32 " by FREERDP_RDPEWA_IUVPAA", forced);
++		return rdpewa_cbor_encode_simple_response(S_OK, forced);
++	}
++
+ 	WLog_DBG(TAG, "IUVPAA: checking for platform authenticators");
+ 
+ 	fido_dev_info_t* devlist = fido_dev_info_new(RDPEWA_MAX_DEVICES);
+@@ -1169,10 +1183,23 @@ wStream* rdpewa_fido_is_uvpaa(void)
+ 
+ wStream* rdpewa_fido_api_version(void)
+ {
+-	WLog_DBG(TAG, "API_VERSION: reporting version 4");
+-
+-	/* Report API version 4 (consistent with Windows 11 / Server 2025) */
+-	return rdpewa_cbor_encode_simple_response(S_OK, 4);
++	/* Report API version 4 by default (consistent with Windows 11 / Server 2025).
++	 * FREERDP_RDPEWA_API_VERSION overrides it: version 6 and later advertise the hybrid
++	 * (phone/caBLE) transport, which an external helper can serve; the server filters
++	 * hybrid out ("filterHybridTransport") for clients reporting less than 6. */
++	UINT32 version = 4;
++	const char* env = getenv("FREERDP_RDPEWA_API_VERSION");
++	if (env && *env)
++	{
++		errno = 0;
++		const unsigned long v = strtoul(env, nullptr, 10);
++		if ((errno == 0) && (v >= 1) && (v <= 9))
++			version = (UINT32)v;
++		else
++			WLog_WARN(TAG, "ignoring invalid FREERDP_RDPEWA_API_VERSION='%s'", env);
++	}
++	WLog_DBG(TAG, "API_VERSION: reporting version %" PRIu32, version);
++	return rdpewa_cbor_encode_simple_response(S_OK, version);
+ }
+ 
+ wStream* rdpewa_fido_get_authenticator_list(void)
+diff --git a/channels/rdpewa/client/rdpewa_helper.c b/channels/rdpewa/client/rdpewa_helper.c
+new file mode 100644
+index 0000000..9887c65
+--- /dev/null
++++ b/channels/rdpewa/client/rdpewa_helper.c
+@@ -0,0 +1,378 @@
++/**
++ * FreeRDP: A Remote Desktop Protocol Implementation
++ * WebAuthn Virtual Channel Extension [MS-RDPEWA] - external helper backend
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <freerdp/config.h>
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++
++#include <winpr/crt.h>
++#include <winpr/assert.h>
++#include <winpr/json.h>
++#include <winpr/wlog.h>
++
++#include <freerdp/crypto/crypto.h>
++#include <freerdp/channels/log.h>
++
++#include "rdpewa_helper.h"
++#include <rdpewa-common.h>
++
++#define TAG CHANNELS_TAG("rdpewa.client")
++
++#define RDPEWA_HELPER_MAX_REPLY (4 * 1024 * 1024)
++
++const char* rdpewa_helper_path(void)
++{
++	const char* path = getenv(RDPEWA_HELPER_ENV);
++	if (!path || !*path)
++		return nullptr;
++	return path;
++}
++
++static char* rdpewa_helper_build_request(const RDPEWA_REQUEST* request)
++{
++	WINPR_ASSERT(request);
++	WINPR_ASSERT(request->request);
++	WINPR_ASSERT(request->requestLen >= 1);
++
++	const BYTE subCommand = request->request[0];
++	const char* command = nullptr;
++	switch (subCommand)
++	{
++		case CTAPCBOR_CMD_MAKE_CREDENTIAL:
++			command = "makeCredential";
++			break;
++		case CTAPCBOR_CMD_GET_ASSERTION:
++			command = "getAssertion";
++			break;
++		default:
++			WLog_ERR(TAG, "helper: unknown WebAuthn sub-command 0x%02" PRIx8, subCommand);
++			return nullptr;
++	}
++
++	char* json = nullptr;
++	char* ctap = crypto_base64_encode(request->request + 1, request->requestLen - 1);
++	if (!ctap)
++		return nullptr;
++
++	WINPR_JSON* obj = WINPR_JSON_CreateObject();
++	if (!obj)
++		goto out;
++
++	if (!WINPR_JSON_AddIntegerToObject(obj, "protocol", 1) ||
++	    !WINPR_JSON_AddStringToObject(obj, "command", command) ||
++	    !WINPR_JSON_AddStringToObject(obj, "rpId", request->rpId) ||
++	    !WINPR_JSON_AddStringToObject(obj, "ctapRequest", ctap) ||
++	    !WINPR_JSON_AddIntegerToObject(obj, "flags", request->flags) ||
++	    !WINPR_JSON_AddIntegerToObject(obj, "timeoutMs", request->timeout) ||
++	    !WINPR_JSON_AddBoolToObject(obj, "filterHybrid", request->filterHybrid))
++		goto out;
++
++	json = WINPR_JSON_PrintUnformatted(obj);
++
++out:
++	WINPR_JSON_Delete(obj);
++	free(ctap);
++	return json;
++}
++
++static BOOL rdpewa_helper_write_all(int fd, const char* data, size_t length)
++{
++	size_t written = 0;
++	while (written < length)
++	{
++		const ssize_t rc = write(fd, data + written, length - written);
++		if (rc < 0)
++		{
++			if (errno == EINTR)
++				continue;
++			return FALSE;
++		}
++		written += (size_t)rc;
++	}
++	return TRUE;
++}
++
++/** Runs the helper, feeds it @p requestJson and returns its complete stdout (NUL terminated). */
++static char* rdpewa_helper_exchange(const char* path, const char* requestJson, int* exitStatus)
++{
++	int toChild[2] = { -1, -1 };
++	int fromChild[2] = { -1, -1 };
++	char* reply = nullptr;
++
++	WINPR_ASSERT(exitStatus);
++	*exitStatus = -1;
++
++	if (pipe(toChild) != 0 || pipe(fromChild) != 0)
++	{
++		WLog_ERR(TAG, "helper: pipe() failed: %s", strerror(errno));
++		goto out;
++	}
++
++	const pid_t pid = fork();
++	if (pid < 0)
++	{
++		WLog_ERR(TAG, "helper: fork() failed: %s", strerror(errno));
++		goto out;
++	}
++
++	if (pid == 0)
++	{
++		/* child */
++		if (dup2(toChild[0], STDIN_FILENO) < 0 || dup2(fromChild[1], STDOUT_FILENO) < 0)
++			_exit(126);
++		close(toChild[0]);
++		close(toChild[1]);
++		close(fromChild[0]);
++		close(fromChild[1]);
++		execl(path, path, (char*)nullptr);
++		_exit(127);
++	}
++
++	/* parent */
++	close(toChild[0]);
++	toChild[0] = -1;
++	close(fromChild[1]);
++	fromChild[1] = -1;
++
++	const size_t len = strlen(requestJson);
++	if (!rdpewa_helper_write_all(toChild[1], requestJson, len) ||
++	    !rdpewa_helper_write_all(toChild[1], "\n", 1))
++		WLog_WARN(TAG, "helper: writing request failed: %s", strerror(errno));
++	close(toChild[1]);
++	toChild[1] = -1;
++
++	size_t cap = 4096;
++	size_t used = 0;
++	reply = calloc(cap, 1);
++	if (!reply)
++		goto wait;
++
++	while (TRUE)
++	{
++		if (used + 1 >= cap)
++		{
++			if (cap >= RDPEWA_HELPER_MAX_REPLY)
++			{
++				WLog_ERR(TAG, "helper: reply exceeds %d bytes", RDPEWA_HELPER_MAX_REPLY);
++				free(reply);
++				reply = nullptr;
++				break;
++			}
++			const size_t ncap = cap * 2;
++			char* tmp = realloc(reply, ncap);
++			if (!tmp)
++			{
++				free(reply);
++				reply = nullptr;
++				break;
++			}
++			reply = tmp;
++			memset(reply + cap, 0, ncap - cap);
++			cap = ncap;
++		}
++		const ssize_t rc = read(fromChild[0], reply + used, cap - used - 1);
++		if (rc < 0)
++		{
++			if (errno == EINTR)
++				continue;
++			WLog_ERR(TAG, "helper: read failed: %s", strerror(errno));
++			free(reply);
++			reply = nullptr;
++			break;
++		}
++		if (rc == 0)
++			break;
++		used += (size_t)rc;
++	}
++
++wait:
++	close(fromChild[0]);
++	fromChild[0] = -1;
++	{
++		int status = 0;
++		while (waitpid(pid, &status, 0) < 0)
++		{
++			if (errno != EINTR)
++				break;
++		}
++		if (WIFEXITED(status))
++			*exitStatus = WEXITSTATUS(status);
++		else if (WIFSIGNALED(status))
++			*exitStatus = 128 + WTERMSIG(status);
++	}
++
++out:
++	for (size_t i = 0; i < 2; i++)
++	{
++		if (toChild[i] >= 0)
++			close(toChild[i]);
++		if (fromChild[i] >= 0)
++			close(fromChild[i]);
++	}
++	return reply;
++}
++
++static UINT32 rdpewa_helper_json_uint(const WINPR_JSON* obj, const char* key, UINT32 defaultValue)
++{
++	WINPR_JSON* item = WINPR_JSON_GetObjectItem(obj, key);
++	if (!item || !WINPR_JSON_IsNumber(item))
++		return defaultValue;
++	const double v = WINPR_JSON_GetNumberValue(item);
++	if (v < 0 || v > (double)UINT32_MAX)
++		return defaultValue;
++	return (UINT32)v;
++}
++
++static const char* rdpewa_helper_json_string(const WINPR_JSON* obj, const char* key)
++{
++	WINPR_JSON* item = WINPR_JSON_GetObjectItem(obj, key);
++	if (!item || !WINPR_JSON_IsString(item))
++		return nullptr;
++	return WINPR_JSON_GetStringValue(item);
++}
++
++static void rdpewa_helper_fill_devinfo(RDPEWA_DEVICE_INFO* devInfo, const WINPR_JSON* reply)
++{
++	WINPR_ASSERT(devInfo);
++
++	const char* provider = reply ? rdpewa_helper_json_string(reply, "provider") : nullptr;
++	/* MS-RDPEWA only knows Hid/Nfc/Ble/Platform; hybrid (phone) is closest to Ble */
++	const char* providerType = "Hid";
++	if (provider && (strcmp(provider, "Hybrid") == 0 || strcmp(provider, "Ble") == 0))
++		providerType = "Ble";
++	else if (provider && strcmp(provider, "Nfc") == 0)
++		providerType = "Nfc";
++
++	strncpy(devInfo->providerType, providerType, sizeof(devInfo->providerType) - 1);
++	strncpy(devInfo->providerName, "freerdp-webauthn-helper", sizeof(devInfo->providerName) - 1);
++	strncpy(devInfo->devicePath, provider ? provider : "helper", sizeof(devInfo->devicePath) - 1);
++	strncpy(devInfo->manufacturer, "FreeRDP", sizeof(devInfo->manufacturer) - 1);
++	strncpy(devInfo->product, "WebAuthn helper", sizeof(devInfo->product) - 1);
++	devInfo->maxMsgSize = 1200;
++	if (reply)
++	{
++		devInfo->uvStatus = (BYTE)rdpewa_helper_json_uint(reply, "uvStatus", 0);
++		devInfo->transports = rdpewa_helper_json_uint(reply, "transports", 0);
++	}
++}
++
++wStream* rdpewa_helper_webauthn(rdpContext* context, const RDPEWA_REQUEST* request)
++{
++	WINPR_UNUSED(context);
++	WINPR_ASSERT(request);
++
++	const char* path = rdpewa_helper_path();
++	if (!path)
++		return nullptr;
++
++	if (!request->request || request->requestLen < 1)
++	{
++		WLog_ERR(TAG, "helper: empty request payload for WEB_AUTHN command");
++		return nullptr;
++	}
++
++	wStream* ret = nullptr;
++	WINPR_JSON* reply = nullptr;
++	BYTE* ctapData = nullptr;
++	size_t ctapLen = 0;
++	RDPEWA_DEVICE_INFO devInfo = WINPR_C_ARRAY_INIT;
++
++	char* requestJson = rdpewa_helper_build_request(request);
++	if (!requestJson)
++		return nullptr;
++
++	WLog_DBG(TAG, "helper: running %s (rpId=%s, %" PRIuz " request bytes)", path, request->rpId,
++	         request->requestLen);
++
++	int exitStatus = -1;
++	char* replyText = rdpewa_helper_exchange(path, requestJson, &exitStatus);
++	free(requestJson);
++
++	if (!replyText)
++	{
++		WLog_ERR(TAG, "helper: no reply from %s (exit status %d)", path, exitStatus);
++		return nullptr; /* infrastructure failure: let the caller fall back */
++	}
++
++	/* The reply is the last non-empty line (helpers may log before it on stdout by mistake). */
++	char* line = replyText;
++	for (char* p = strrchr(replyText, '\n'); p; p = strrchr(replyText, '\n'))
++	{
++		*p = '\0';
++		if (p[1] != '\0')
++		{
++			line = p + 1;
++			break;
++		}
++	}
++
++	reply = WINPR_JSON_Parse(line);
++	if (!reply)
++	{
++		WLog_ERR(TAG, "helper: reply is not valid JSON (exit status %d)", exitStatus);
++		free(replyText);
++		return nullptr;
++	}
++
++	rdpewa_helper_fill_devinfo(&devInfo, reply);
++
++	const char* status = rdpewa_helper_json_string(reply, "status");
++	if (!status || strcmp(status, "ok") != 0)
++	{
++		const char* message = rdpewa_helper_json_string(reply, "message");
++		const UINT32 ctapStatus = rdpewa_helper_json_uint(reply, "ctapStatus", 0x01);
++		const UINT32 hresult = rdpewa_helper_json_uint(reply, "hresult", (UINT32)E_FAIL);
++		WLog_WARN(TAG, "helper: operation failed: %s (ctapStatus=0x%02" PRIx32
++		          ", hresult=0x%08" PRIx32 ", exit=%d)",
++		          message ? message : "unknown", ctapStatus, hresult, exitStatus);
++		ret = rdpewa_cbor_encode_webauthn_response((HRESULT)hresult, (BYTE)ctapStatus, nullptr, 0,
++		                                           &devInfo);
++		goto out;
++	}
++
++	const char* ctapB64 = rdpewa_helper_json_string(reply, "ctapResponse");
++	if (!ctapB64)
++	{
++		WLog_ERR(TAG, "helper: ok reply without ctapResponse");
++		ret = rdpewa_cbor_encode_webauthn_response(E_FAIL, 0x01, nullptr, 0, &devInfo);
++		goto out;
++	}
++
++	crypto_base64_decode(ctapB64, strlen(ctapB64), &ctapData, &ctapLen);
++	if (!ctapData || ctapLen == 0)
++	{
++		WLog_ERR(TAG, "helper: ctapResponse is not valid base64");
++		ret = rdpewa_cbor_encode_webauthn_response(E_FAIL, 0x01, nullptr, 0, &devInfo);
++		goto out;
++	}
++
++	WLog_DBG(TAG, "helper: success, %" PRIuz " CTAP response bytes via %s", ctapLen,
++	         devInfo.providerType);
++	ret = rdpewa_cbor_encode_webauthn_response(S_OK, 0x00, ctapData, ctapLen, &devInfo);
++
++out:
++	free(ctapData);
++	WINPR_JSON_Delete(reply);
++	free(replyText);
++	return ret;
++}
+diff --git a/channels/rdpewa/client/rdpewa_helper.h b/channels/rdpewa/client/rdpewa_helper.h
+new file mode 100644
+index 0000000..c7f710b
+--- /dev/null
++++ b/channels/rdpewa/client/rdpewa_helper.h
+@@ -0,0 +1,51 @@
++/**
++ * FreeRDP: A Remote Desktop Protocol Implementation
++ * WebAuthn Virtual Channel Extension [MS-RDPEWA] - external helper backend
++ *
++ * Delegates CTAP MakeCredential / GetAssertion requests to an out-of-process
++ * helper (see FREERDP_RDPEWA_HELPER) that can talk to authenticators libfido2
++ * cannot reach, e.g. phones over the hybrid (caBLE) transport.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef FREERDP_CHANNEL_RDPEWA_CLIENT_HELPER_H
++#define FREERDP_CHANNEL_RDPEWA_CLIENT_HELPER_H
++
++#include <winpr/stream.h>
++#include <freerdp/freerdp.h>
++
++#include "rdpewa_cbor.h"
++
++/** Environment variable naming the helper executable. Unset/empty = disabled. */
++#define RDPEWA_HELPER_ENV "FREERDP_RDPEWA_HELPER"
++
++/** @return path of the configured helper or nullptr if the helper backend is disabled */
++const char* rdpewa_helper_path(void);
++
++/** Run a CTAPCBOR_RPC_COMMAND_WEB_AUTHN request through the external helper.
++ *
++ *  Protocol (newline-delimited JSON, one request on the helper's stdin, one reply on its stdout):
++ *    -> {"protocol":1,"command":"makeCredential"|"getAssertion","rpId":"...",
++ *        "ctapRequest":"<base64 CTAP2 request map>","flags":N,"timeoutMs":N,"filterHybrid":bool}
++ *    <- {"status":"ok","ctapResponse":"<base64 CTAP2 response map>",
++ *        "provider":"Hybrid"|"Hid"|"Nfc"|"Ble","uvStatus":N,"transports":N}
++ *    <- {"status":"error","ctapStatus":N,"hresult":N,"message":"..."}
++ *
++ *  @return the encoded channel response, or nullptr if the helper could not be run at all
++ *          (caller should fall back to the libfido2 backend).
++ */
++WINPR_ATTR_MALLOC(Stream_Free, 1)
++wStream* rdpewa_helper_webauthn(rdpContext* context, const RDPEWA_REQUEST* request);
++
++#endif /* FREERDP_CHANNEL_RDPEWA_CLIENT_HELPER_H */
+diff --git a/channels/rdpewa/client/rdpewa_main.c b/channels/rdpewa/client/rdpewa_main.c
+index 01ac09b..68029b7 100644
+--- a/channels/rdpewa/client/rdpewa_main.c
++++ b/channels/rdpewa/client/rdpewa_main.c
+@@ -32,6 +32,7 @@
+ #include "rdpewa_main.h"
+ #include "rdpewa_cbor.h"
+ #include "rdpewa_fido.h"
++#include "rdpewa_helper.h"
+ #include <rdpewa-common.h>
+ 
+ #include <freerdp/client/channels.h>
+@@ -56,7 +57,12 @@ static DWORD WINAPI rdpewa_async_webauthn_thread(LPVOID arg)
+ 	switch (work->request.command)
+ 	{
+ 		case CTAPCBOR_RPC_COMMAND_WEB_AUTHN:
+-			s = rdpewa_fido_webauthn(work->rdpContext, &work->request);
++			/* External helper (FREERDP_RDPEWA_HELPER) first, e.g. for phone/hybrid passkeys;
++			 * fall back to libfido2 if it is not configured or could not be run. */
++			if (rdpewa_helper_path())
++				s = rdpewa_helper_webauthn(work->rdpContext, &work->request);
++			if (!s)
++				s = rdpewa_fido_webauthn(work->rdpContext, &work->request);
+ 			break;
+ 		default:
+ 			break;
+@@ -254,6 +260,7 @@ static UINT rdpewa_init_plugin_cb(GENERIC_DYNVC_PLUGIN* base, rdpContext* rconte
+ 	WINPR_UNUSED(settings);
+ 
+ 	RDPEWA_PLUGIN* rdpewa = (RDPEWA_PLUGIN*)base;
++	base->allowMultipleInstances = TRUE;
+ 	rdpewa->rdp_context = rcontext;
+ 	return CHANNEL_RC_OK;
+ }

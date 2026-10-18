@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Azure Virtual Desktop (Remmina)
+Comment=Remmina with FreeRDP passkey helper for AVD
+Exec=sh -c 'exec "$HOME/.local/bin/remmina-avd"'
+Icon=org.remmina.Remmina
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=AVD;RDP;Azure;

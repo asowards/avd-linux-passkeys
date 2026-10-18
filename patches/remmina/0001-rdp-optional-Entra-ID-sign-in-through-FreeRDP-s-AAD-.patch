@@ -1,0 +1,186 @@
+From b6a724ae7cb171558656513549cd8204cb26400d Mon Sep 17 00:00:00 2001
+From: Aaron Sowards <asowards@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 20:21:18 -0400
+Subject: [PATCH 1/3] rdp: optional Entra ID sign-in through FreeRDP's AAD auth
+ helper
+
+Entra ID sign-in currently runs in an embedded WebKitGTK view, which has no
+WebAuthn implementation, so tenants that require passkeys, FIDO2 security
+keys or phone passkeys at sign-in cannot connect to Azure Virtual Desktop
+from Remmina.
+
+FreeRDP >= 3.32 exports its out-of-process AAD auth helper
+(<freerdp/client/aad_helper.h>), which opens the system browser (or its own
+webview) and reports the redirect back; one helper is kept per connection
+so the browser session carries over from the gateway token to the
+session-host token.
+
+Add two RDP profile settings, compiled only when the helper API is present:
+- "aad_external_browser": route GetAccessToken through the FreeRDP helper
+  instead of the WebKitGTK view;
+- "aad_browser": optional browser command passed to the helper
+  (FREERDP_AAD_BROWSER), e.g. a Flatpak Chrome, for tenants whose
+  sign-in needs a browser capability the default one lacks.
+
+The helper process is stopped when the connection's FreeRDP instance is
+freed.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ plugins/rdp/CMakeLists.txt |  7 ++++
+ plugins/rdp/rdp_plugin.c   |  7 ++++
+ plugins/rdp/rdp_web_auth.c | 65 ++++++++++++++++++++++++++++++++++++++
+ plugins/rdp/rdp_web_auth.h |  5 +++
+ 4 files changed, 84 insertions(+)
+
+diff --git a/plugins/rdp/CMakeLists.txt b/plugins/rdp/CMakeLists.txt
+index e78d9b27b..18c0b7da5 100644
+--- a/plugins/rdp/CMakeLists.txt
++++ b/plugins/rdp/CMakeLists.txt
+@@ -103,6 +103,13 @@ if(WITH_RDP_AUTH_AAD)
+         message(STATUS "Enabling RDP AAD authentication.")
+         # we cannot undefine WITH_AAD defined in FreeRDP so we use our own macro
+         add_definitions(-DWITH_RDP_AUTH_AAD)
++        # FreeRDP >= 3.32 exports its out-of-process AAD auth helper (system browser or
++        # embedded webview, see <freerdp/client/aad_helper.h>). Unlike the WebKitGTK view it
++        # supports passkeys/WebAuthn at sign-in, which Entra ID increasingly requires.
++        if(EXISTS "${FreeRDP_INCLUDE_DIR}/freerdp/client/aad_helper.h")
++            message(STATUS "FreeRDP AAD auth helper API found, enabling external sign-in option.")
++            add_definitions(-DWITH_RDP_AAD_HELPER)
++        endif()
+         include_directories(
+             ${WEBKIT2GTK_INCLUDE_DIRS}
+             ${LIBSOUP_INCLUDE_DIRS})
+diff --git a/plugins/rdp/rdp_plugin.c b/plugins/rdp/rdp_plugin.c
+index f928f4042..17c69e603 100644
+--- a/plugins/rdp/rdp_plugin.c
++++ b/plugins/rdp/rdp_plugin.c
+@@ -2818,6 +2818,9 @@ static void rfi_uninit(rfContext *rfi)
+ 	}
+ 
+ 	if (instance) {
++#ifdef WITH_RDP_AAD_HELPER
++		remmina_rdp_aad_helper_stop(instance);
++#endif
+ 		RDP_CLIENT_ENTRY_POINTS *pEntryPoints = instance->pClientEntryPoints;
+ 		if (pEntryPoints)
+ 			IFCALL(pEntryPoints->GlobalUninit);
+@@ -3413,6 +3416,10 @@ static const RemminaProtocolSetting remmina_rdp_advanced_settings[] =
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_TEXT,	  "gateway_username",	    N_("Remote Desktop Gateway username"),		 FALSE, NULL,		  NULL														 },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_PASSWORD, "gateway_password",	    N_("Remote Desktop Gateway password"),		 FALSE, NULL,		  NULL														 },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_TEXT,	  "gateway_domain",	    N_("Remote Desktop Gateway domain"),		 FALSE, NULL,		  NULL														 },
++#ifdef WITH_RDP_AAD_HELPER
++	{ REMMINA_PROTOCOL_SETTING_TYPE_CHECK,	  "aad_external_browser",   N_("Entra ID sign-in in the system browser (passkeys)"),	 TRUE,	NULL,		  N_("Use FreeRDP's AAD auth helper and the system browser for the Entra ID sign-in instead of the embedded web view. Required for passkeys, FIDO2 security keys and phone passkeys at sign-in.")											 },
++	{ REMMINA_PROTOCOL_SETTING_TYPE_TEXT,	  "aad_browser",	    N_("Browser command for Entra ID sign-in"),		 FALSE, NULL,		  N_("Optional. Command used to open the sign-in page, e.g. \"flatpak run com.google.Chrome\". Empty uses the default browser (xdg-open).")											 },
++#endif
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_TEXT,	  "clientname",		    N_("Client name"),					 FALSE, NULL,		  NULL														 },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_COMBO,	  "clientbuild",	    N_("Client build"),					 FALSE, clientbuild_list, clientbuild_tooltip												 },
+ 	{ REMMINA_PROTOCOL_SETTING_TYPE_TEXT,	  "exec",		    N_("Start-up program"),				 FALSE, NULL,		  NULL														 },
+diff --git a/plugins/rdp/rdp_web_auth.c b/plugins/rdp/rdp_web_auth.c
+index 53cd19af3..bee93d85f 100644
+--- a/plugins/rdp/rdp_web_auth.c
++++ b/plugins/rdp/rdp_web_auth.c
+@@ -60,6 +60,9 @@ static BOOL remmina_sso_mib_try_access_token(freerdp *instance, AccessTokenType
+ #ifdef WITH_RDP_AUTH_AAD
+ #include "rdp_plugin.h"
+ #include <webkit2/webkit2.h>
++#ifdef WITH_RDP_AAD_HELPER
++#include <freerdp/client/aad_helper.h>
++#endif
+ #include <freerdp/utils/aad.h>
+ #include <winpr/wtypes.h>
+ #include <winpr/wlog.h>
+@@ -384,12 +387,74 @@ cleanup:
+ 	return rc && (*token != NULL);
+ }
+ 
++#ifdef WITH_RDP_AAD_HELPER
++/* Entra ID sign-in through FreeRDP's out-of-process AAD auth helper instead of the embedded
++ * WebKitGTK view. The helper opens the system browser (or its own webview), which supports
++ * passkeys / FIDO2 security keys / phone passkeys; WebKitGTK has no WebAuthn implementation.
++ * One helper instance is kept for the connection so the browser session carries over from the
++ * gateway token to the session-host token (single sign-in). */
++static gboolean remmina_rdp_aad_helper_enabled(freerdp* instance)
++{
++	rfContext* rfi = (rfContext*)instance->context;
++	RemminaFile* remminafile = remmina_plugin_service->protocol_plugin_get_file(rfi->protocol_widget);
++	return remmina_plugin_service->file_get_int(remminafile, "aad_external_browser", FALSE);
++}
++
++static BOOL remmina_rdp_aad_helper_get_access_token(freerdp* instance, AccessTokenType tokenType,
++                                                    char** token, size_t count, va_list ap)
++{
++	rfContext* rfi = (rfContext*)instance->context;
++	rdpClientContext* cctx = &rfi->clientContext;
++	RemminaFile* remminafile = remmina_plugin_service->protocol_plugin_get_file(rfi->protocol_widget);
++
++	/* Optional browser override, honoured by FreeRDP's xdg-open based helper. */
++	const gchar* browser = remmina_plugin_service->file_get_string(remminafile, "aad_browser");
++	if (browser && *browser)
++		g_setenv("FREERDP_AAD_BROWSER", browser, TRUE);
++
++	if (!aad_auth_helper_is_running(cctx->aadHelper)) {
++		aad_auth_helper_stop(cctx->aadHelper);
++		cctx->aadHelper = aad_auth_helper_start(cctx);
++		if (!cctx->aadHelper) {
++			REMMINA_PLUGIN_ERROR("Could not start the FreeRDP AAD auth helper");
++			return FALSE;
++		}
++	}
++
++	const BOOL rc = aad_auth_helper_get_access_token_v(cctx->aadHelper, tokenType, token, count, ap);
++	if (!rc && !aad_auth_helper_is_running(cctx->aadHelper)) {
++		aad_auth_helper_stop(cctx->aadHelper);
++		cctx->aadHelper = NULL;
++	}
++	return rc;
++}
++
++void remmina_rdp_aad_helper_stop(freerdp* instance)
++{
++	if (!instance || !instance->context)
++		return;
++	rfContext* rfi = (rfContext*)instance->context;
++	aad_auth_helper_stop(rfi->clientContext.aadHelper);
++	rfi->clientContext.aadHelper = NULL;
++}
++#endif /* WITH_RDP_AAD_HELPER */
++
+ BOOL remmina_rdp_get_access_token(freerdp* instance, AccessTokenType tokenType, char** token,
+ 									size_t count, ...)
+ {
+ 	const char* scope = NULL;
+ 	const char* req_cnf = NULL;
+ 
++#ifdef WITH_RDP_AAD_HELPER
++	if (remmina_rdp_aad_helper_enabled(instance)) {
++		va_list hap = { 0 };
++		va_start(hap, count);
++		const BOOL hrc = remmina_rdp_aad_helper_get_access_token(instance, tokenType, token, count, hap);
++		va_end(hap);
++		return hrc;
++	}
++#endif
++
+ 	va_list ap = { 0 };
+ 	va_start(ap, count);
+ 	if (tokenType == ACCESS_TOKEN_TYPE_AAD)
+diff --git a/plugins/rdp/rdp_web_auth.h b/plugins/rdp/rdp_web_auth.h
+index 2b0f1dd76..463d68087 100644
+--- a/plugins/rdp/rdp_web_auth.h
++++ b/plugins/rdp/rdp_web_auth.h
+@@ -39,6 +39,11 @@
+ #if FREERDP_VERSION_MAJOR >= 3
+ #include <freerdp/freerdp.h>
+ 
++#ifdef WITH_RDP_AAD_HELPER
++/* Stops the FreeRDP AAD auth helper process kept for this connection, if any. */
++void remmina_rdp_aad_helper_stop(freerdp* instance);
++#endif
++
+ BOOL remmina_rdp_get_access_token(freerdp* instance, AccessTokenType tokenType, char** token,
+                                     size_t count, ...);
+ #endif
+-- 
+2.43.0
+

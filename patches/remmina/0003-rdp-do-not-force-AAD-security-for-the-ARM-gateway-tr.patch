@@ -1,0 +1,38 @@
+From bc87632249d3276a2ef7b8d4d00b08161e874038 Mon Sep 17 00:00:00 2001
+From: Aaron Sowards <asowards@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 20:36:26 -0400
+Subject: [PATCH 3/3] rdp: do not force AAD security for the ARM gateway
+ transport
+
+Selecting the ARM gateway transport also switched the session-host
+security to AAD. That only works for Entra-joined hosts with single
+sign-on; AD-joined Azure Virtual Desktop hosts (RDSTLS logon with a
+password after the gateway redirect) reject it with
+HYBRID_REQUIRED_BY_SERVER. The gateway transport and the host security
+are independent: leave the latter to the "security" setting, whose "aad"
+entry still covers Entra-joined hosts.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ plugins/rdp/rdp_plugin.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/rdp/rdp_plugin.c b/plugins/rdp/rdp_plugin.c
+index be4d38a1d..66cfa0da2 100644
+--- a/plugins/rdp/rdp_plugin.c
++++ b/plugins/rdp/rdp_plugin.c
+@@ -2024,7 +2024,10 @@ static gboolean remmina_rdp_main(RemminaProtocolWidget *gp)
+ 			freerdp_settings_set_bool(rfi->clientContext.context.settings, FreeRDP_GatewayHttpTransport, FALSE);
+ 			freerdp_settings_set_bool(rfi->clientContext.context.settings, FreeRDP_GatewayHttpUseWebsockets, FALSE);
+ 			freerdp_settings_set_bool(rfi->clientContext.context.settings, FreeRDP_GatewayArmTransport, TRUE);
+-			freerdp_settings_set_bool(rfi->clientContext.context.settings, FreeRDP_AadSecurity, TRUE);
++			/* The session host's security is a separate choice ("security" setting): AD-joined
++			 * AVD hosts need NLA/RDSTLS with a password (negotiated by default), Entra-joined
++			 * hosts with SSO use "aad". Forcing AAD here made the former fail with
++			 * HYBRID_REQUIRED_BY_SERVER. */
+ #endif
+ 		}
+ 		remmina_plugin_service->get_server_port(s, 443, &gateway_host, &gateway_port);
+-- 
+2.43.0
+

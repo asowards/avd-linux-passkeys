@@ -1,0 +1,9 @@
+{
+  "SDL_KeyModMask": ["KMOD_LCTRL", "KMOD_LALT"],
+  "SDL_Fullscreen": "SDL_SCANCODE_RETURN",
+  "SDL_Minimize": "SDL_SCANCODE_M",
+  "SDL_Resizeable": "SDL_SCANCODE_R",
+  "SDL_Grab": "SDL_SCANCODE_G",
+  "SDL_Disconnect": "SDL_SCANCODE_D",
+  "SDL_ConnectionDialog": false
+}

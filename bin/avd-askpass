@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# FreeRDP askpass helper (FREERDP_ASKPASS): prints the Windows password for the RDSTLS
+# logon. Sources, in order: GNOME keyring (secret-tool, service avd-connect, user $AVD_USER),
+# then a zenity dialog. $1 is FreeRDP's prompt text.
+set -euo pipefail
+PROMPT="${1:-Windows password}"
+if [ -n "${AVD_USER:-}" ] && [ "${AVD_NO_KEYRING:-0}" != 1 ] && command -v secret-tool >/dev/null 2>&1; then
+    PW="$(secret-tool lookup service avd-connect user "$AVD_USER" 2>/dev/null || true)"
+    if [ -n "$PW" ]; then printf '%s\n' "$PW"; exit 0; fi
+fi
+if command -v zenity >/dev/null 2>&1; then
+    exec zenity --password --title="AVD: $PROMPT"
+fi
+echo "avd-askpass: no keyring entry and no zenity" >&2
+exit 1
