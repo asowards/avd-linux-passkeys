@@ -38,7 +38,7 @@ if [ "$DO_DEPS" = 1 ]; then
         build-essential cmake git pkg-config \
         libssl-dev libx11-dev libxext-dev libxinerama-dev libxcursor-dev libxdamage-dev \
         libxv-dev libxkbfile-dev libasound2-dev libcups2-dev libxml2-dev libpam0g-dev \
-        libfido2-dev libcbor-dev libpcsclite-dev libjson-c-dev libpulse-dev libusb-1.0-0-dev \
+        libfido2-dev libcbor-dev libpcsclite-dev libjson-c-dev libpulse-dev libusb-1.0-0-dev libfuse3-dev \
         libavcodec-dev libavutil-dev libswscale-dev libkrb5-dev \
         libsdl2-dev libsdl2-ttf-dev libwebkit2gtk-4.1-dev \
         libgtk-3-dev libdbus-1-dev libudev-dev libv4l-dev \
