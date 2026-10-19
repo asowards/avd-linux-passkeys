@@ -28,6 +28,23 @@ done
 log() { printf '\n==> %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# A CMake cache survives OS upgrades with dead paths in it (soname bumps, python3.X
+# include dirs) and cached values never re-search. If any cached path is gone, wipe
+# the build dir so configure starts fresh.
+fresh_build_dir() {
+    local build="$1" dead=""
+    [ -f "$build/CMakeCache.txt" ] || return 0
+    while IFS= read -r p; do
+        case "$p" in /*) ;; *) continue ;; esac
+        case "$p" in *NOTFOUND*) continue ;; esac
+        [ -e "$p" ] || { dead="$p"; break; }
+    done < <(sed -n 's/^[^=:]*:\(PATH\|FILEPATH\)=//p' "$build/CMakeCache.txt")
+    if [ -n "$dead" ]; then
+        log "Stale build cache in $build (missing: $dead); wiping it"
+        rm -rf "$build"
+    fi
+}
+
 PATCHES=("$PROJECT_DIR"/patches/*.patch)
 [ -e "${PATCHES[0]}" ] || die "no patches found in $PROJECT_DIR/patches"
 
@@ -44,7 +61,7 @@ if [ "$DO_DEPS" = 1 ]; then
         libgtk-3-dev libdbus-1-dev libudev-dev libv4l-dev \
         libwayland-dev libxkbcommon-dev libdecor-0-dev libegl1-mesa-dev libgles-dev libdrm-dev libgbm-dev \
         libibus-1.0-dev libfreetype-dev libharfbuzz-dev libxi-dev libxrandr-dev libxss-dev libxfixes-dev \
-        libsecret-tools zenity flatpak python3 \
+        libsecret-tools zenity flatpak python3 python3-dev \
         libgcrypt20-dev libsodium-dev libjson-glib-dev libsecret-1-dev libssh-dev libvte-2.91-dev \
         libayatana-appindicator3-dev libavahi-ui-gtk3-dev libavahi-client-dev intltool libsoup-3.0-dev
 else
@@ -72,6 +89,7 @@ build_sdl() {
         git clone --depth 1 --branch "$tag" "$url" "$dir"
     fi
     log "Building $name"
+    fresh_build_dir "$dir/build"
     cmake -S "$dir" -B "$dir/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" "$@"
     cmake --build "$dir/build" -j"$(nproc)"
     log "Installing $name to $PREFIX (sudo)"
@@ -136,6 +154,7 @@ MSG
 done
 
 # 5. Configure, build, install
+fresh_build_dir "$BUILD_DIR"
 log "Configuring"
 cmake -S "$FREERDP_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -197,6 +216,7 @@ if [ "${DO_REMMINA:-1}" = 1 ]; then
         fi
     done
     log "Configuring and building Remmina"
+    fresh_build_dir "$REMMINA_DIR/build"
     PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" cmake -S "$REMMINA_DIR" -B "$REMMINA_DIR/build" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_PREFIX_PATH="$PREFIX" \
         -DWITH_FREERDP3=ON -DWITH_RDP_AUTH_AAD=ON -DWITH_LIBVNCSERVER=OFF -DWITH_GVNC=OFF \
